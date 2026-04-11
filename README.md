@@ -25,7 +25,7 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Multi-connection HTTP/HTTPS | Up to 16 parallel connections per download |
 | Content-Disposition detection | Automatic filename from server headers |
 | Custom headers | User-Agent, Referer, cookies, arbitrary headers |
-| Checksum verification | MD5, SHA-1, SHA-256 |
+| Checksum verification | MD5, SHA-256 |
 | Concurrent download management | Priority queue (Critical/High/Normal/Low) |
 | Pause / resume / cancel | Full lifecycle control |
 | Event system | Broadcast channels for progress, state changes |
@@ -57,6 +57,7 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | uTP transport | 29 | LEDBAT congestion control, wired into peer connections (opt-in) |
 | HTTP resume | — | ETag/Last-Modified validation |
 | Mirror/failover | — | Automatic failover to alternate URLs |
+| Bandwidth scheduling | — | Time-of-day rules with live runtime limit updates |
 | Recursive HTTP mirroring | — | Feature-gated via `recursive-http`; crawls HTML directory indexes and expands into ordinary HTTP downloads |
 | Private torrent handling | 27 | Disables DHT/PEX/LPD |
 | Choking algorithm | — | Unchoke rotation, optimistic unchoking |
@@ -67,7 +68,6 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 |---------|-------|
 | DHT IPv6 | Depends on upstream `mainline` crate |
 | Proxy support | Config field exists, not tested |
-| Bandwidth scheduling | Code exists, not tested |
 | File preallocation | Config field exists, not tested |
 
 ## Quick Start
@@ -76,7 +76,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-dl = "0.1"
+gosh-dl = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -84,7 +84,7 @@ To enable recursive HTTP directory mirroring:
 
 ```toml
 [dependencies]
-gosh-dl = { version = "0.1", features = ["recursive-http"] }
+gosh-dl = { version = "0.4", features = ["recursive-http"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -277,7 +277,8 @@ while let Ok(event) = events.recv().await {
 ## Configuration
 
 ```rust
-use gosh_dl::{EngineConfig, HttpConfig, DownloadPriority};
+use gosh_dl::{EngineConfig, HttpConfig, TorrentConfig};
+use gosh_dl::config::WebSeedConfig;
 use std::path::PathBuf;
 
 let config = EngineConfig {
@@ -294,9 +295,25 @@ let config = EngineConfig {
     max_peers: 55,
     seed_ratio: 1.0,
     database_path: Some(PathBuf::from("/data/gosh-dl.db")),
+    http: HttpConfig {
+        max_retries: 8,
+        read_timeout: 90,
+        ..Default::default()
+    },
+    torrent: TorrentConfig {
+        webseed: WebSeedConfig {
+            enabled: true,
+            max_connections: 6,
+            ..Default::default()
+        },
+        ..Default::default()
+    },
     ..Default::default()
 };
 ```
+
+You can also apply a replacement config at runtime with `engine.set_config(config)?;`.
+Queue concurrency and global bandwidth limits are applied to the live engine when you do this.
 
 ### Bandwidth Scheduling
 
