@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-09
+
+### Added
+- Batch operations: `pause_all()`, `resume_all()`, and `cancel_all()` engine APIs with per-download outcomes reported via the new `BatchResult` type (#11)
+- Pluggable persistence: `DownloadEngine::with_storage()` accepts any custom `Storage` implementation, enabling resume-from-breakpoint without the built-in SQLite storage or the `storage` feature (#11)
+- `FileStorage`: built-in file-based storage using one JSON sidecar per download (aria2 control-file analog) with atomic temp-file writes
+- `Segment` and `SegmentState` now derive `Serialize`/`Deserialize`, and `async_trait` is re-exported from `gosh_dl::storage`, making third-party `Storage` implementations easier
+
+### Changed
+- `pause()` (and `pause_all()`) now accepts downloads in the `Queued` state, so pausing the whole queue no longer lets waiting downloads get promoted into freed slots
+- Recursive discovery now fetches pages concurrently, honoring the previously unused `RecursiveOptions::max_discovery_concurrency` option (#10)
+- Updated transitive dependencies to pick up security fixes: quinn-proto 0.11.14, aws-lc-rs 1.17.0 / aws-lc-sys 0.41.0, rustls 0.23.40, rustls-webpki 0.103.13, reqwest 0.13.4, rand 0.9.4 / 0.10.1
+
+### Fixed
+- Pausing or cancelling a queued download no longer leaves an orphaned entry in the priority queue that could later acquire a download slot
+- CI workflow now declares least-privilege `permissions: contents: read` (CodeQL alerts #1, #2, #3, #5)
+
 ## [0.4.0] - 2026-04-11
 
 ### Added

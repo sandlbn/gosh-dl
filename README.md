@@ -76,7 +76,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-dl = "0.4"
+gosh-dl = "0.5"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -84,7 +84,7 @@ To enable recursive HTTP directory mirroring:
 
 ```toml
 [dependencies]
-gosh-dl = { version = "0.4", features = ["recursive-http"] }
+gosh-dl = { version = "0.5", features = ["recursive-http"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -133,6 +133,13 @@ let magnet_id = engine.add_magnet(magnet_uri, options).await?;
 engine.pause(id).await?;
 engine.resume(id).await?;
 engine.cancel(id, delete_files).await?;
+
+// Batch control (aria2 pauseAll/unpauseAll analogs).
+// Pauses queued downloads too, and returns per-download outcomes.
+let result = engine.pause_all().await;
+println!("paused {}, skipped {}", result.succeeded.len(), result.skipped.len());
+engine.resume_all().await;
+engine.cancel_all(delete_files).await;
 
 // Priority
 engine.set_priority(id, DownloadPriority::High)?;
@@ -232,6 +239,7 @@ Current scope:
 - persists tracked parent recursive jobs and restores them on restart
 - exposes aggregate parent status, lifecycle methods, and a dedicated parent event stream
 - propagates headers, cookies, user-agent, and referer during discovery
+- discovery fetches pages concurrently, bounded by `max_discovery_concurrency` (default 4)
 
 Current limitations:
 
@@ -315,6 +323,27 @@ let config = EngineConfig {
 You can also apply a replacement config at runtime with `engine.set_config(config)?;`.
 Queue concurrency and global bandwidth limits are applied to the live engine when you do this.
 
+### Persistence & Custom Storage
+
+Setting `database_path` persists download state to the built-in SQLite storage
+(`storage` feature) so downloads resume across restarts. If you maintain your
+own metadata store — or just prefer plain files — inject any implementation of
+the `Storage` trait instead:
+
+```rust
+use std::sync::Arc;
+use gosh_dl::{DownloadEngine, EngineConfig, FileStorage};
+
+// aria2-control-file style JSON sidecars, one per download:
+let storage = Arc::new(FileStorage::new("/data/gosh-dl-state").await?);
+let engine = DownloadEngine::with_storage(EngineConfig::default(), storage).await?;
+```
+
+`FileStorage` (JSON sidecar files) and `MemoryStorage` ship with the crate and
+work without the `storage` feature. To bring your own database, implement the
+`Storage` trait (the `#[async_trait]` attribute is re-exported from
+`gosh_dl::storage`) and pass it to `DownloadEngine::with_storage`.
+
 ### Bandwidth Scheduling
 
 ```rust
@@ -392,6 +421,8 @@ gosh-dl was designed as a native Rust alternative to [aria2](https://aria2.githu
 | `aria2.addTorrent(torrent)` | `engine.add_torrent(bytes, opts)` |
 | `aria2.pause(gid)` | `engine.pause(id)` |
 | `aria2.unpause(gid)` | `engine.resume(id)` |
+| `aria2.pauseAll()` | `engine.pause_all()` |
+| `aria2.unpauseAll()` | `engine.resume_all()` |
 | `aria2.remove(gid)` | `engine.cancel(id, false)` |
 | `aria2.tellStatus(gid)` | `engine.status(id)` |
 | `aria2.tellActive()` | `engine.active()` |
