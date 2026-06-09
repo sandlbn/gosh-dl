@@ -12,7 +12,7 @@ gosh-dl brings download functionality directly into your Rust application as a n
 
 Whether you're building a media application that needs BitTorrent with streaming support, a package manager requiring resilient HTTP downloads with checksums and mirrors, or any software that moves files across the network, gosh-dl provides the complete feature set you need. Multi-connection acceleration splits large downloads across parallel connections for maximum throughput. Automatic resume with ETag validation ensures interrupted transfers pick up exactly where they left off. Full BitTorrent support includes DHT for trackerless operation, peer exchange for efficient swarm discovery, and protocol encryption for privacy.
 
-The engine handles the complexity of segmented downloads, tracker communication, DHT peer discovery, and connection encryption while exposing a clean, intuitive API that integrates naturally with Tokio-based applications. Priority queues let you control which downloads matter most, bandwidth scheduling adapts to time-of-day constraints, and SQLite persistence ensures nothing is lost across restarts.
+The engine handles the complexity of segmented downloads, tracker communication, DHT peer discovery, and connection encryption while exposing a clean, intuitive API that integrates naturally with Tokio-based applications. Priority queues let you control which downloads matter most, bandwidth scheduling adapts to time-of-day constraints, and persistence — built-in SQLite, JSON sidecar files, or your own `Storage` implementation — ensures nothing is lost across restarts.
 
 A standalone CLI is available in the companion `gosh-dl-cli` project for users who want command-line access to the engine.
 
@@ -27,10 +27,11 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Custom headers | User-Agent, Referer, cookies, arbitrary headers |
 | Checksum verification | MD5, SHA-256 |
 | Concurrent download management | Priority queue (Critical/High/Normal/Low) |
-| Pause / resume / cancel | Full lifecycle control |
+| Pause / resume / cancel | Full lifecycle control, per download or in batch (`pause_all` / `resume_all` / `cancel_all`) |
 | Event system | Broadcast channels for progress, state changes |
 | Global statistics | Active count, aggregate speeds |
 | SQLite persistence | WAL mode, schema versioning, crash recovery |
+| Pluggable persistence | Inject any `Storage` impl via `with_storage()`; built-in `FileStorage` JSON sidecars (aria2 control-file analog) |
 
 ### Tested BitTorrent Core
 
@@ -58,7 +59,7 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | HTTP resume | — | ETag/Last-Modified validation |
 | Mirror/failover | — | Automatic failover to alternate URLs |
 | Bandwidth scheduling | — | Time-of-day rules with live runtime limit updates |
-| Recursive HTTP mirroring | — | Feature-gated via `recursive-http`; crawls HTML directory indexes and expands into ordinary HTTP downloads |
+| Recursive HTTP mirroring | — | Feature-gated via `recursive-http`; crawls HTML directory indexes with bounded-concurrency discovery and expands into ordinary HTTP downloads |
 | Private torrent handling | 27 | Disables DHT/PEX/LPD |
 | Choking algorithm | — | Unchoke rotation, optimistic unchoking |
 
