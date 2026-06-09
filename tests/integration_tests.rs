@@ -3306,3 +3306,514 @@ async fn test_segment_progress_saved_on_failure() {
 
     engine.shutdown().await.ok();
 }
+
+// ---------------------------------------------------------------------------
+// Batch operations (pause_all / resume_all / cancel_all)
+// ---------------------------------------------------------------------------
+
+/// Mount a slow 1MB endpoint at the given path.
+async fn mount_slow_file(mock_server: &MockServer, file_path: &str, delay: Duration) {
+    let content = vec![0u8; 1024 * 1024];
+    Mock::given(method("HEAD"))
+        .and(path(file_path))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(file_path))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content)
+                .set_delay(delay),
+        )
+        .mount(mock_server)
+        .await;
+}
+
+#[tokio::test]
+async fn test_pause_all_resume_all() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    for name in ["/batch-a.bin", "/batch-b.bin", "/batch-c.bin"] {
+        mount_slow_file(&mock_server, name, Duration::from_secs(10)).await;
+    }
+
+    // Two slots so the third download stays queued.
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_concurrent_downloads: 2,
+        max_connections_per_download: 4,
+        min_segment_size: 1024 * 1024,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    let mut ids = Vec::new();
+    for name in ["batch-a.bin", "batch-b.bin", "batch-c.bin"] {
+        let url = format!("{}/{}", mock_server.uri(), name);
+        ids.push(
+            engine
+                .add_http(&url, DownloadOptions::default())
+                .await
+                .expect("Failed to add download"),
+        );
+    }
+
+    // Wait for the two slots to fill.
+    for _ in 0..2 {
+        wait_for_event(
+            &mut events,
+            |e| matches!(e, DownloadEvent::Started { .. }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Downloads should start");
+    }
+
+    let result = engine.pause_all().await;
+    assert_eq!(
+        result.succeeded.len(),
+        3,
+        "All three downloads (including the queued one) should pause, got: {:?}",
+        result
+    );
+    assert!(
+        result.failed.is_empty(),
+        "No failures expected: {:?}",
+        result
+    );
+
+    // No download may be promoted back into a running state.
+    for id in &ids {
+        let status = engine.status(*id).expect("Should have status");
+        assert_eq!(
+            status.state,
+            DownloadState::Paused,
+            "Download {} should be paused",
+            id
+        );
+    }
+
+    let result = engine.resume_all().await;
+    assert_eq!(
+        result.succeeded.len(),
+        3,
+        "All three downloads should resume, got: {:?}",
+        result
+    );
+
+    // Resumed downloads must be active or queued again.
+    for id in &ids {
+        let status = engine.status(*id).expect("Should have status");
+        assert!(
+            status.state.is_active() || status.state == DownloadState::Queued,
+            "Download {} should be running or queued after resume_all, got {:?}",
+            id,
+            status.state
+        );
+    }
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_pause_all_skips_completed() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    // One fast download that completes, one slow one that stays active.
+    let small = b"hello world".to_vec();
+    Mock::given(method("HEAD"))
+        .and(path("/fast.bin"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", small.len().to_string()),
+        )
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/fast.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", small.len().to_string())
+                .set_body_bytes(small),
+        )
+        .mount(&mock_server)
+        .await;
+    mount_slow_file(&mock_server, "/slow.bin", Duration::from_secs(10)).await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let mut events = engine.subscribe();
+
+    let fast_id = engine
+        .add_http(
+            &format!("{}/fast.bin", mock_server.uri()),
+            DownloadOptions::default(),
+        )
+        .await
+        .expect("Failed to add fast download");
+    wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Completed { id } if *id == fast_id),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("Fast download should complete");
+
+    let slow_id = engine
+        .add_http(
+            &format!("{}/slow.bin", mock_server.uri()),
+            DownloadOptions::default(),
+        )
+        .await
+        .expect("Failed to add slow download");
+    wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Started { id } if *id == slow_id),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("Slow download should start");
+
+    let result = engine.pause_all().await;
+    assert_eq!(result.succeeded, vec![slow_id]);
+    assert!(
+        result.skipped.is_empty(),
+        "Completed download should not be collected at all"
+    );
+    assert!(result.failed.is_empty());
+
+    let status = engine.status(fast_id).expect("Should have status");
+    assert_eq!(status.state, DownloadState::Completed);
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_cancel_all() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    for name in ["/cancel-a.bin", "/cancel-b.bin"] {
+        mount_slow_file(&mock_server, name, Duration::from_secs(10)).await;
+    }
+
+    let engine = create_test_engine(&temp_dir).await;
+    let mut events = engine.subscribe();
+
+    let mut ids = Vec::new();
+    for name in ["cancel-a.bin", "cancel-b.bin"] {
+        let url = format!("{}/{}", mock_server.uri(), name);
+        ids.push(
+            engine
+                .add_http(&url, DownloadOptions::default())
+                .await
+                .expect("Failed to add download"),
+        );
+    }
+    for _ in 0..2 {
+        wait_for_event(
+            &mut events,
+            |e| matches!(e, DownloadEvent::Started { .. }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Downloads should start");
+    }
+
+    let result = engine.cancel_all(true).await;
+    assert_eq!(
+        result.succeeded.len(),
+        2,
+        "Both downloads should cancel: {:?}",
+        result
+    );
+    assert!(engine.list().is_empty(), "No downloads should remain");
+
+    for id in ids {
+        let removed = wait_for_event(
+            &mut events,
+            |e| matches!(e, DownloadEvent::Removed { id: eid } if *eid == id),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(removed.is_some(), "Should receive Removed event for {}", id);
+    }
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_pause_queued_download() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    mount_slow_file(&mock_server, "/queue-first.bin", Duration::from_secs(10)).await;
+    mount_slow_file(&mock_server, "/queue-second.bin", Duration::from_secs(10)).await;
+
+    // Single slot: the second download stays queued.
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_concurrent_downloads: 1,
+        max_connections_per_download: 4,
+        min_segment_size: 1024 * 1024,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    let first = engine
+        .add_http(
+            &format!("{}/queue-first.bin", mock_server.uri()),
+            DownloadOptions::default(),
+        )
+        .await
+        .expect("Failed to add first download");
+    wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Started { id } if *id == first),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("First download should start");
+
+    let second = engine
+        .add_http(
+            &format!("{}/queue-second.bin", mock_server.uri()),
+            DownloadOptions::default(),
+        )
+        .await
+        .expect("Failed to add second download");
+    assert_eq!(
+        engine.status(second).expect("Should have status").state,
+        DownloadState::Queued
+    );
+
+    // Pause the queued download directly.
+    engine
+        .pause(second)
+        .await
+        .expect("Pausing a queued download should work");
+    assert_eq!(
+        engine.status(second).expect("Should have status").state,
+        DownloadState::Paused
+    );
+
+    // Free the slot; the paused download must not get promoted into it.
+    engine.cancel(first, true).await.expect("Failed to cancel");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        engine.status(second).expect("Should have status").state,
+        DownloadState::Paused,
+        "Paused download must not start when a slot frees up"
+    );
+
+    // And it can still be resumed normally.
+    engine.resume(second).await.expect("Failed to resume");
+    wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Started { id } if *id == second),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("Resumed download should start");
+
+    engine.shutdown().await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Custom storage injection (DownloadEngine::with_storage)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_with_storage_memory_resume_across_engines() {
+    use gosh_dl::MemoryStorage;
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let content: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    Mock::given(method("HEAD"))
+        .and(path("/persist.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/persist.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone())
+                .set_delay(Duration::from_millis(500)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let storage = Arc::new(MemoryStorage::new());
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_concurrent_downloads: 4,
+        max_connections_per_download: 4,
+        min_segment_size: 1024 * 1024,
+        ..Default::default()
+    };
+
+    // First engine: start a download, pause it, shut down.
+    let id = {
+        let engine = DownloadEngine::with_storage(config.clone(), storage.clone())
+            .await
+            .expect("Failed to create engine with storage");
+        let mut events = engine.subscribe();
+
+        let id = engine
+            .add_http(
+                &format!("{}/persist.bin", mock_server.uri()),
+                DownloadOptions::default(),
+            )
+            .await
+            .expect("Failed to add download");
+        wait_for_event(
+            &mut events,
+            |e| matches!(e, DownloadEvent::Started { id: eid } if *eid == id),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Download should start");
+
+        engine.pause(id).await.expect("Failed to pause");
+        engine.shutdown().await.ok();
+        id
+    };
+
+    // Second engine sharing the same storage: the download must be restored
+    // as paused and resumable to completion.
+    let engine = DownloadEngine::with_storage(config, storage)
+        .await
+        .expect("Failed to recreate engine with storage");
+    let status = engine
+        .status(id)
+        .expect("Download should be restored from injected storage");
+    assert_eq!(status.state, DownloadState::Paused);
+
+    let mut events = engine.subscribe();
+    engine.resume(id).await.expect("Failed to resume");
+    wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Completed { id: eid } if *eid == id),
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("Resumed download should complete");
+
+    let file = temp_dir.path().join("persist.bin");
+    let downloaded = tokio::fs::read(&file).await.expect("File should exist");
+    assert_eq!(downloaded, content);
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_with_storage_file_storage_resume_across_engines() {
+    use gosh_dl::FileStorage;
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let state_dir = TempDir::new().expect("Failed to create state dir");
+    let mock_server = MockServer::start().await;
+
+    let content = b"file storage round trip".to_vec();
+    Mock::given(method("HEAD"))
+        .and(path("/sidecar.bin"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", content.len().to_string()),
+        )
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/sidecar.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone())
+                .set_delay(Duration::from_millis(500)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        ..Default::default()
+    };
+
+    let id = {
+        let storage = Arc::new(
+            FileStorage::new(state_dir.path())
+                .await
+                .expect("Failed to create file storage"),
+        );
+        let engine = DownloadEngine::with_storage(config.clone(), storage)
+            .await
+            .expect("Failed to create engine with file storage");
+        let mut events = engine.subscribe();
+
+        let id = engine
+            .add_http(
+                &format!("{}/sidecar.bin", mock_server.uri()),
+                DownloadOptions::default(),
+            )
+            .await
+            .expect("Failed to add download");
+        wait_for_event(
+            &mut events,
+            |e| matches!(e, DownloadEvent::Started { id: eid } if *eid == id),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Download should start");
+
+        engine.pause(id).await.expect("Failed to pause");
+        engine.shutdown().await.ok();
+        id
+    };
+
+    // A fresh FileStorage over the same directory must restore the download.
+    let storage = Arc::new(
+        FileStorage::new(state_dir.path())
+            .await
+            .expect("Failed to reopen file storage"),
+    );
+    let engine = DownloadEngine::with_storage(config, storage)
+        .await
+        .expect("Failed to recreate engine with file storage");
+    let status = engine
+        .status(id)
+        .expect("Download should be restored from sidecar files");
+    assert_eq!(status.state, DownloadState::Paused);
+
+    let mut events = engine.subscribe();
+    engine.resume(id).await.expect("Failed to resume");
+    wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Completed { id: eid } if *eid == id),
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("Resumed download should complete");
+
+    engine.shutdown().await.ok();
+}

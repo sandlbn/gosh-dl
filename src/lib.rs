@@ -53,7 +53,7 @@ pub(crate) mod types;
 
 // Re-exports for convenience
 pub use config::{AllocationMode, EngineConfig, HttpConfig, TorrentConfig};
-pub use engine::DownloadEngine;
+pub use engine::{BatchResult, DownloadEngine};
 pub use error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result, StorageErrorKind};
 pub use protocol::{ProtocolError, ProtocolResult};
 pub use types::{
@@ -71,7 +71,7 @@ pub use types::{
 // Storage exports
 #[cfg(feature = "storage")]
 pub use storage::SqliteStorage;
-pub use storage::{MemoryStorage, Segment, SegmentState, Storage};
+pub use storage::{FileStorage, MemoryStorage, Segment, SegmentState, Storage};
 
 // Priority queue exports
 pub use priority_queue::{DownloadPriority, PriorityQueue, PriorityQueueStats};

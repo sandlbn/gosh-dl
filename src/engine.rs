@@ -118,6 +118,19 @@ struct TorrentDownloadHandle {
     progress_task: tokio::task::JoinHandle<()>,
 }
 
+/// Per-download outcomes of a batch operation such as
+/// [`DownloadEngine::pause_all`] or [`DownloadEngine::resume_all`].
+#[derive(Debug, Default)]
+pub struct BatchResult {
+    /// Downloads the operation was applied to successfully.
+    pub succeeded: Vec<DownloadId>,
+    /// Downloads skipped because their state changed between snapshot and
+    /// action (e.g. a download completed while `pause_all` was running).
+    pub skipped: Vec<DownloadId>,
+    /// Downloads where the operation failed with a real error.
+    pub failed: Vec<(DownloadId, EngineError)>,
+}
+
 /// The main download engine
 pub struct DownloadEngine {
     /// Weak self-reference for spawning background tasks from `&self` methods
@@ -164,10 +177,77 @@ impl DownloadEngine {
     }
 
     /// Create a new download engine with the given configuration
+    ///
+    /// When the `storage` feature is enabled and `config.database_path` is
+    /// set, download state is persisted to the built-in SQLite storage. To
+    /// use a custom [`Storage`] implementation instead, see
+    /// [`with_storage`](Self::with_storage).
     pub async fn new(config: EngineConfig) -> Result<Arc<Self>> {
         // Validate configuration
         config.validate()?;
 
+        // Initialize persistent storage
+        #[cfg(feature = "storage")]
+        let storage: Option<Arc<dyn Storage>> = if let Some(ref db_path) = config.database_path {
+            match SqliteStorage::new(db_path).await {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize database storage: {}. Downloads will not be persisted.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "storage"))]
+        let storage: Option<Arc<dyn Storage>> = None;
+
+        Self::build(config, storage).await
+    }
+
+    /// Create a new download engine that persists state to the given
+    /// [`Storage`] implementation.
+    ///
+    /// This allows applications that maintain their own metadata store
+    /// (custom database, sidecar files, ...) to get full pause/resume and
+    /// crash-recovery support without the built-in SQLite storage or the
+    /// `storage` feature. Previously persisted downloads are loaded from
+    /// the given storage during construction.
+    ///
+    /// `config.database_path` is ignored when this constructor is used; the
+    /// injected storage always wins.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use gosh_dl::{DownloadEngine, EngineConfig, MemoryStorage};
+    ///
+    /// # async fn example() -> gosh_dl::Result<()> {
+    /// let storage = Arc::new(MemoryStorage::new());
+    /// let engine = DownloadEngine::with_storage(EngineConfig::default(), storage).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn with_storage(
+        config: EngineConfig,
+        storage: Arc<dyn Storage>,
+    ) -> Result<Arc<Self>> {
+        config.validate()?;
+
+        if config.database_path.is_some() {
+            tracing::warn!(
+                "Both an injected storage and config.database_path are set; \
+                 using the injected storage and ignoring database_path"
+            );
+        }
+
+        Self::build(config, Some(storage)).await
+    }
+
+    /// Shared construction path for [`new`](Self::new) and
+    /// [`with_storage`](Self::with_storage). Expects a validated config.
+    async fn build(config: EngineConfig, storage: Option<Arc<dyn Storage>>) -> Result<Arc<Self>> {
         // Create event channel
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -188,22 +268,6 @@ impl DownloadEngine {
                 upload: config.global_upload_limit,
             },
         )));
-
-        // Initialize persistent storage
-        #[cfg(feature = "storage")]
-        let storage: Option<Arc<dyn Storage>> = if let Some(ref db_path) = config.database_path {
-            match SqliteStorage::new(db_path).await {
-                Ok(s) => Some(Arc::new(s)),
-                Err(e) => {
-                    tracing::warn!("Failed to initialize database storage: {}. Downloads will not be persisted.", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        #[cfg(not(feature = "storage"))]
-        let storage: Option<Arc<dyn Storage>> = None;
 
         let engine = Arc::new_cyclic(|weak| Self {
             self_ref: weak.clone(),
@@ -822,7 +886,7 @@ impl DownloadEngine {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at));
         jobs
     }
 
@@ -1821,8 +1885,17 @@ impl DownloadEngine {
         self.update_state(id, DownloadState::Queued)?;
 
         let task = tokio::spawn(async move {
-            // Acquire priority queue permit for concurrent limit
-            let _permit = priority_queue.acquire(id, priority).await;
+            // Acquire priority queue permit for concurrent limit, bailing out
+            // promptly if the download is paused/cancelled while still queued.
+            let _permit = tokio::select! {
+                permit = priority_queue.acquire(id, priority) => permit,
+                _ = cancel_token_clone.cancelled() => {
+                    // The dropped acquire future leaves its entry in the
+                    // waiting heap; remove it so it can't win a permit later.
+                    priority_queue.remove(id);
+                    return Ok(());
+                }
+            };
 
             // Check if cancelled before starting
             if cancel_token_clone.is_cancelled() {
@@ -2119,8 +2192,11 @@ impl DownloadEngine {
                 .get_mut(&id)
                 .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
 
-            // Check if can be paused
-            if !download.status.state.is_active() {
+            // Check if can be paused. Queued downloads are pausable too:
+            // their task is parked waiting for a permit and bails out when
+            // the cancel token fires.
+            if !download.status.state.is_active() && download.status.state != DownloadState::Queued
+            {
                 return Err(EngineError::InvalidState {
                     action: "pause",
                     current_state: format!("{:?}", download.status.state),
@@ -2446,6 +2522,105 @@ impl DownloadEngine {
         self.remove_recursive_group_member(recursive_group_id, id);
 
         Ok(())
+    }
+
+    /// Pause every active or queued download.
+    ///
+    /// Queued downloads are paused as well so that freed slots do not
+    /// immediately promote them back into running state. Downloads that
+    /// change state while the batch is in flight are reported as skipped.
+    /// Per-download `StateChanged`/`Paused` events are emitted as usual;
+    /// there is no separate batch event.
+    pub async fn pause_all(&self) -> BatchResult {
+        let ids: Vec<DownloadId> = {
+            let downloads = self.downloads.read();
+            downloads
+                .iter()
+                .filter(|(_, d)| {
+                    d.status.state.is_active() || d.status.state == DownloadState::Queued
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+
+        let mut result = BatchResult::default();
+        for id in ids {
+            match self.pause(id).await {
+                Ok(()) => result.succeeded.push(id),
+                Err(EngineError::InvalidState { .. }) | Err(EngineError::NotFound(_)) => {
+                    result.skipped.push(id);
+                }
+                Err(e) => result.failed.push((id, e)),
+            }
+        }
+        result
+    }
+
+    /// Resume every paused download.
+    ///
+    /// Downloads that change state while the batch is in flight are reported
+    /// as skipped. Per-download `Resumed` events are emitted as usual.
+    pub async fn resume_all(&self) -> BatchResult {
+        let ids: Vec<DownloadId> = {
+            let downloads = self.downloads.read();
+            downloads
+                .iter()
+                .filter(|(_, d)| d.status.state == DownloadState::Paused)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+
+        let mut result = BatchResult::default();
+        for id in ids {
+            match self.resume(id).await {
+                Ok(()) => result.succeeded.push(id),
+                Err(EngineError::InvalidState { .. }) | Err(EngineError::NotFound(_)) => {
+                    result.skipped.push(id);
+                }
+                Err(e) => result.failed.push((id, e)),
+            }
+        }
+        result
+    }
+
+    /// Cancel every download, optionally deleting downloaded files.
+    ///
+    /// Tracked recursive job records are removed as well, since all of their
+    /// children are gone after this call. Per-download `Removed` events are
+    /// emitted as usual.
+    pub async fn cancel_all(&self, delete_files: bool) -> BatchResult {
+        let ids: Vec<DownloadId> = self.downloads.read().keys().copied().collect();
+
+        let mut result = BatchResult::default();
+        for id in ids {
+            match self.cancel(id, delete_files).await {
+                Ok(()) => result.succeeded.push(id),
+                Err(EngineError::NotFound(_)) => result.skipped.push(id),
+                Err(e) => result.failed.push((id, e)),
+            }
+        }
+
+        // All children are gone; drop the now-empty recursive job records.
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        {
+            let jobs: Vec<crate::types::TrackedRecursiveJob> = {
+                let mut recursive_jobs = self.recursive_jobs.write();
+                recursive_jobs.drain().map(|(_, job)| job).collect()
+            };
+            for job in jobs {
+                self.unregister_recursive_job_membership(&job);
+                if let Some(ref storage) = self.storage {
+                    if let Err(e) = storage.delete_recursive_job(job.id).await {
+                        tracing::warn!("Failed to delete recursive job {}: {}", job.id, e);
+                    }
+                }
+                let _ = self
+                    .recursive_job_event_tx
+                    .send(crate::types::RecursiveJobEvent::Removed { id: job.id });
+            }
+        }
+
+        result
     }
 
     /// Get the status of a download

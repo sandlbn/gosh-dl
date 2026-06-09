@@ -1,11 +1,23 @@
 //! Storage Module
 //!
 //! This module handles persistent storage for download state and session data.
-//! Uses SQLite with WAL mode for crash-safe atomic commits.
+//! Three implementations are provided:
+//!
+//! - [`SqliteStorage`] (behind the `storage` feature): SQLite with WAL mode
+//!   for crash-safe atomic commits, used automatically by
+//!   `DownloadEngine::new` when `EngineConfig::database_path` is set.
+//! - [`FileStorage`]: JSON sidecar files, one per download, similar to
+//!   aria2's `.aria2` control files.
+//! - [`MemoryStorage`]: in-memory, for tests and storage-less pause/resume.
+//!
+//! Applications with their own metadata store can implement the [`Storage`]
+//! trait and pass it to `DownloadEngine::with_storage`.
 
+pub(crate) mod file;
 #[cfg(feature = "storage")]
 pub(crate) mod sqlite;
 
+pub use file::FileStorage;
 #[cfg(feature = "storage")]
 pub use sqlite::SqliteStorage;
 
@@ -13,11 +25,15 @@ use crate::error::Result;
 #[cfg(feature = "recursive-http")]
 use crate::types::TrackedRecursiveJob;
 use crate::types::{DownloadId, DownloadStatus};
-use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// Re-exported so custom `Storage` implementations don't need to depend on
+// the `async-trait` crate themselves.
+pub use async_trait::async_trait;
+
 /// Segment state for HTTP multi-connection downloads
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SegmentState {
     /// Segment is waiting to be downloaded
     Pending,
@@ -30,7 +46,7 @@ pub enum SegmentState {
 }
 
 /// Represents a download segment for multi-connection HTTP downloads
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Segment {
     /// Segment index (0-based)
     pub index: usize,
@@ -75,7 +91,15 @@ impl Segment {
 /// Storage trait for persisting download state
 ///
 /// Implementations of this trait handle storing and retrieving download
-/// state to allow resume after crashes or restarts.
+/// state to allow resume after crashes or restarts. Custom implementations
+/// can be plugged into the engine via `DownloadEngine::with_storage`, e.g.
+/// to keep download metadata in an application's own database.
+///
+/// Annotate implementations with the re-exported
+/// [`#[async_trait]`](async_trait) attribute. The runtime-metadata methods
+/// and (under the `recursive-http` feature, which also adds `uuid` to the
+/// trait surface) the recursive-job methods have no-op defaults; everything
+/// else is required.
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Save or update a download's status
