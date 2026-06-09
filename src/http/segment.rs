@@ -578,14 +578,9 @@ impl SegmentedDownload {
                                 connections,
                                 seeders: 0,
                                 peers: 0,
-                                eta_seconds: if current_speed > 0 {
-                                    Some(
-                                        (total_size.saturating_sub(total_downloaded))
-                                            / current_speed,
-                                    )
-                                } else {
-                                    None
-                                },
+                                eta_seconds: total_size
+                                    .saturating_sub(total_downloaded)
+                                    .checked_div(current_speed),
                             };
                             log_progress_invariant("segmented http download", &progress);
                             progress_callback(progress);
@@ -847,11 +842,7 @@ impl SegmentedDownload {
                 let remaining = self
                     .total_size
                     .saturating_sub(self.state.downloaded.load(Ordering::Relaxed));
-                if speed > 0 {
-                    Some(remaining / speed)
-                } else {
-                    None
-                }
+                remaining.checked_div(speed)
             },
         };
         log_progress_invariant("segmented http download", &progress);

@@ -272,12 +272,10 @@ impl UtpSocketInner {
                 }
             }
 
-            ConnectionState::Closing => {
-                if pkt.is_state() {
-                    self.process_acks(pkt.ack_nr, pkt.selective_ack.as_ref());
-                    if self.pending_packets.is_empty() {
-                        self.state = ConnectionState::Closed;
-                    }
+            ConnectionState::Closing if pkt.is_state() => {
+                self.process_acks(pkt.ack_nr, pkt.selective_ack.as_ref());
+                if self.pending_packets.is_empty() {
+                    self.state = ConnectionState::Closed;
                 }
             }
 

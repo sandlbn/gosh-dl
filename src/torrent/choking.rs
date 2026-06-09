@@ -124,11 +124,11 @@ impl ChokingManager {
         if is_seeding {
             // When seeding: prefer peers we upload fastest to
             // This encourages fast distribution
-            interested_peers.sort_by(|a, b| b.1.upload_rate.cmp(&a.1.upload_rate));
+            interested_peers.sort_by_key(|peer| std::cmp::Reverse(peer.1.upload_rate));
         } else {
             // When downloading: prefer peers we download fastest from (reciprocity)
             // This encourages tit-for-tat behavior
-            interested_peers.sort_by(|a, b| b.1.download_rate.cmp(&a.1.download_rate));
+            interested_peers.sort_by_key(|peer| std::cmp::Reverse(peer.1.download_rate));
         }
 
         // Take top N peers for regular unchoke slots

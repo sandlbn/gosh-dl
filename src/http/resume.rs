@@ -241,17 +241,16 @@ pub fn validate_ranged_response(
 }
 
 pub fn should_restart_without_ranges(err: &EngineError) -> bool {
-    match err {
+    matches!(
+        err,
         EngineError::Protocol {
             kind: ProtocolErrorKind::RangeNotSupported,
             ..
-        } => true,
-        EngineError::Network {
+        } | EngineError::Network {
             kind: NetworkErrorKind::HttpStatus(416),
             ..
-        } => true,
-        _ => false,
-    }
+        }
+    )
 }
 
 /// Calculate the range header value for resuming

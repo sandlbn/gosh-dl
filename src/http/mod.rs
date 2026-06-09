@@ -480,11 +480,7 @@ impl HttpDownloader {
                                 seeders: 0,
                                 peers: 0,
                                 eta_seconds: total_size.and_then(|total| {
-                                    if speed > 0 {
-                                        Some((total.saturating_sub(completed)) / speed)
-                                    } else {
-                                        None
-                                    }
+                                    total.saturating_sub(completed).checked_div(speed)
                                 }),
                             };
                             log_progress_invariant("http download", &progress);
