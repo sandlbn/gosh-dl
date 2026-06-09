@@ -8,10 +8,11 @@ use super::connection::with_retry;
 use super::{HttpDownloader, ACCEPT_ENCODING_IDENTITY};
 use crate::error::{EngineError, Result};
 use crate::types::{DownloadOptions, RecursiveEntry, RecursiveManifest, RecursiveOptions};
+use futures::stream::{FuturesUnordered, StreamExt};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use url::Url;
 
 const MAX_DISCOVERY_HTML_BYTES: usize = 2 * 1024 * 1024;
@@ -282,7 +283,7 @@ fn pattern_matches(pattern: &str, candidate: &str) -> bool {
     pattern_idx == pattern.len()
 }
 
-fn path_is_selected(relative_path: &PathBuf, recursive: &RecursiveOptions) -> bool {
+fn path_is_selected(relative_path: &Path, recursive: &RecursiveOptions) -> bool {
     let candidate = relative_path.to_string_lossy().replace('\\', "/");
 
     if recursive
@@ -462,20 +463,40 @@ pub(crate) async fn discover(
     let mut queue = VecDeque::from([(parsed_url.clone(), 0usize)]);
     let mut visited_pages = HashSet::new();
     let mut discovered: BTreeMap<String, RecursiveEntry> = BTreeMap::new();
+    // Fetches run with bounded concurrency; responses are processed (and new
+    // pages enqueued) one at a time on this task, so manifest construction
+    // stays deterministic. On error the unfinished fetches are dropped.
+    let mut in_flight = FuturesUnordered::new();
 
-    while let Some((current_url, depth)) = queue.pop_front() {
-        if !visited_pages.insert(current_url.as_str().to_string()) {
-            continue;
-        }
+    loop {
+        // Fill available fetch slots from the BFS queue.
+        while in_flight.len() < recursive.max_discovery_concurrency {
+            let Some((current_url, depth)) = queue.pop_front() else {
+                break;
+            };
 
-        if visited_pages.len() > MAX_DISCOVERED_PAGES {
-            return Err(EngineError::ResourceLimit {
-                resource: "recursive_pages",
-                limit: MAX_DISCOVERED_PAGES,
+            if !visited_pages.insert(current_url.as_str().to_string()) {
+                continue;
+            }
+
+            if visited_pages.len() > MAX_DISCOVERED_PAGES {
+                return Err(EngineError::ResourceLimit {
+                    resource: "recursive_pages",
+                    limit: MAX_DISCOVERED_PAGES,
+                });
+            }
+
+            in_flight.push(async move {
+                let response = fetch_discovery_response(http, &current_url, options).await;
+                (depth, response)
             });
         }
 
-        let response = fetch_discovery_response(http, &current_url, options).await?;
+        let Some((depth, response)) = in_flight.next().await else {
+            break; // queue drained and no fetches in flight
+        };
+        let response = response?;
+
         if !is_url_in_scope(&response.final_url, &parsed_url, recursive, depth) {
             return Err(EngineError::invalid_input(
                 "root_url",
@@ -822,6 +843,84 @@ mod tests {
         assert_eq!(
             paths,
             vec!["ignore.txt", "readme.txt", "releases/app.tar.gz"]
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_concurrent_matches_sequential_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_engine(&temp_dir).await;
+        let server = MockServer::start().await;
+
+        let dir_page = |links: &[&str]| {
+            let body = links
+                .iter()
+                .map(|link| format!(r#"<a href="{link}">{link}</a>"#))
+                .collect::<String>();
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(format!("<html><body>{body}</body></html>"))
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/pub/"))
+            .respond_with(dir_page(&["a/", "b/", "c/", "top.txt"]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pub/a/"))
+            .respond_with(dir_page(&["one.bin", "nested/"]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pub/a/nested/"))
+            .respond_with(dir_page(&["deep.bin"]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pub/b/"))
+            .respond_with(dir_page(&["two.bin"]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pub/c/"))
+            .respond_with(dir_page(&[]))
+            .mount(&server)
+            .await;
+
+        let root = format!("{}/pub/", server.uri());
+        let sequential = engine
+            .discover_http_recursive(
+                &root,
+                &DownloadOptions::default(),
+                &RecursiveOptions {
+                    max_discovery_concurrency: 1,
+                    ..RecursiveOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let concurrent = engine
+            .discover_http_recursive(
+                &root,
+                &DownloadOptions::default(),
+                &RecursiveOptions {
+                    max_discovery_concurrency: 4,
+                    ..RecursiveOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(sequential, concurrent);
+        let paths: Vec<_> = concurrent
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["a/nested/deep.bin", "a/one.bin", "b/two.bin", "top.txt"]
         );
     }
 
