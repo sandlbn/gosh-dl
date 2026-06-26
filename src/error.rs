@@ -190,8 +190,10 @@ impl EngineError {
         let retryable = matches!(
             kind,
             NetworkErrorKind::Timeout
+                | NetworkErrorKind::ConnectionRefused
                 | NetworkErrorKind::ConnectionReset
                 | NetworkErrorKind::Unreachable
+                | NetworkErrorKind::Other
                 | NetworkErrorKind::HttpStatus(408)
                 | NetworkErrorKind::HttpStatus(429)
                 | NetworkErrorKind::HttpStatus(500..=599)

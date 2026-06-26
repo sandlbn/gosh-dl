@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-06-25
+
+### Fixed
+
+- **`NetworkErrorKind::ConnectionRefused` and `NetworkErrorKind::Other`
+  are now classified as retryable.** Previously only `Timeout`,
+  `ConnectionReset`, `Unreachable`, and certain HTTP statuses (408, 429,
+  5xx) triggered the internal retry policy. This meant:
+
+  - **ConnectionRefused** — the textbook transient error, fired when a
+    server temporarily refuses during a load spike — was never retried
+    despite being recoverable in seconds.
+  - **Other** — the catch-all bucket for reqwest errors that don't match
+    any specific kind (notably the generic `"error sending request for
+    url ..."` family, which covers DNS, TLS-handshake, and unclassified
+    TCP transport failures) — was also never retried. Reqwest already
+    splits decode / redirect / status errors into their own variants,
+    so `Other` is dominated by transient connect-time conditions.
+
+  The previous behaviour caused recursive HTTP crawls of community-run
+  mirrors (e.g. hvsc.brona.dk) to abort entire subtrees on the first
+  connect blip, even though a subsequent request would have succeeded.
+  Outer callers were forced to wrap whole-job retries around already-
+  resilient operations.
+
+  This change brings gosh-dl in line with the retry policies of curl,
+  wget, and most production HTTP clients. The retry budget is still
+  bounded by `HttpConfig::retry_delay_ms` and `max_retry_delay_ms`.
+
 ## [0.5.1] - 2026-06-25 (rolled into 0.5.2)
 
 ### Added
