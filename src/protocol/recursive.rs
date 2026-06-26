@@ -33,6 +33,19 @@ pub struct RecursiveOptions {
     pub fail_fast: bool,
     /// Maximum number of discovery requests allowed to run concurrently.
     pub max_discovery_concurrency: usize,
+    /// Optional override for the maximum number of files the crawler will
+    /// enumerate before bailing with `ResourceLimit { resource:
+    /// "recursive_files" }`. `None` uses the engine's built-in safe default
+    /// (10,000). Callers mirroring large trees (e.g. HVSC ≈ 75k files) can
+    /// raise this; the crawler still aborts past whatever ceiling is set.
+    #[serde(default)]
+    pub max_files: Option<usize>,
+    /// Optional override for the maximum number of HTML index pages the
+    /// crawler will fetch before bailing with `ResourceLimit { resource:
+    /// "recursive_pages" }`. `None` uses the built-in safe default (1024).
+    /// Trees with many small directories may need this raised.
+    #[serde(default)]
+    pub max_pages: Option<usize>,
 }
 
 impl Default for RecursiveOptions {
@@ -47,6 +60,8 @@ impl Default for RecursiveOptions {
             overwrite_existing: false,
             fail_fast: false,
             max_discovery_concurrency: 4,
+            max_files: None,
+            max_pages: None,
         }
     }
 }

@@ -60,6 +60,13 @@ fn normalize_url(candidate: &str, base: &Url) -> Result<Url> {
 
     let mut normalized = joined;
     normalized.set_fragment(None);
+    // Strip query strings. Directory-index servers (Apache mod_autoindex,
+    // nginx autoindex, lighttpd, IIS) use queries only for sort/order/
+    // display switches — `?C=N;O=D`, `?C=M;O=A`, etc. Two URLs that differ
+    // only by query string serve the same content. Without this, every
+    // sort variant gets enqueued as a "new" page to crawl, multiplying
+    // the request count by 5× against the upstream mirror.
+    normalized.set_query(None);
 
     let trailing_slash = normalized.path().ends_with('/');
     let normalized_path = normalize_path(normalized.path(), trailing_slash)?;
@@ -340,6 +347,11 @@ fn extract_links(html: &str) -> Vec<String> {
     document
         .select(&selector)
         .filter_map(|node| node.value().attr("href"))
+        // Defense in depth: skip hrefs that are only a query string
+        // (`?C=N;O=D`, Apache mod_autoindex sort links). normalize_url
+        // also strips query strings, but filtering here avoids the work
+        // of resolving + normalising in the first place.
+        .filter(|h| !h.trim_start().starts_with('?'))
         .map(ToOwned::to_owned)
         .collect()
 }
@@ -479,10 +491,11 @@ pub(crate) async fn discover(
                 continue;
             }
 
-            if visited_pages.len() > MAX_DISCOVERED_PAGES {
+            let pages_ceiling = recursive.max_pages.unwrap_or(MAX_DISCOVERED_PAGES);
+            if visited_pages.len() > pages_ceiling {
                 return Err(EngineError::ResourceLimit {
                     resource: "recursive_pages",
-                    limit: MAX_DISCOVERED_PAGES,
+                    limit: pages_ceiling,
                 });
             }
 
@@ -543,10 +556,11 @@ pub(crate) async fn discover(
                     recursive,
                 )?;
 
-                if discovered.len() > MAX_DISCOVERED_FILES {
+                let files_ceiling = recursive.max_files.unwrap_or(MAX_DISCOVERED_FILES);
+                if discovered.len() > files_ceiling {
                     return Err(EngineError::ResourceLimit {
                         resource: "recursive_files",
-                        limit: MAX_DISCOVERED_FILES,
+                        limit: files_ceiling,
                     });
                 }
             }
@@ -576,8 +590,8 @@ pub(crate) async fn discover(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_relative_path, insert_entry, is_url_in_scope, normalize_path, normalize_url,
-        normalized_scope_prefix, path_is_selected, pattern_matches,
+        build_relative_path, extract_links, insert_entry, is_url_in_scope, normalize_path,
+        normalize_url, normalized_scope_prefix, path_is_selected, pattern_matches,
     };
     use crate::types::RecursiveOptions;
     use crate::{DownloadEngine, DownloadOptions, EngineConfig, EngineError, RecursiveEntry};
@@ -608,6 +622,44 @@ mod tests {
 
         let normalized = normalize_url("../../etc/passwd", &base).unwrap();
         assert_eq!(normalized.as_str(), "https://example.com/etc/passwd");
+    }
+
+    #[test]
+    fn normalize_url_strips_query_string() {
+        // Apache mod_autoindex sort variants share content with the canonical
+        // directory URL — they must collapse to the same normalised form.
+        let base = Url::parse("https://www.prg.dtu.dk/HVSC/C64Music/").unwrap();
+        let canonical = normalize_url("MUSICIANS/C/Cyke/", &base).unwrap();
+        let sort_by_date = normalize_url("MUSICIANS/C/Cyke/?C=D;O=A", &base).unwrap();
+        let sort_by_size = normalize_url("MUSICIANS/C/Cyke/?C=S;O=A", &base).unwrap();
+        assert_eq!(canonical, sort_by_date);
+        assert_eq!(canonical, sort_by_size);
+    }
+
+    #[test]
+    fn extract_links_drops_apache_sort_variants() {
+        // Real fragment of an Apache mod_autoindex page (DTU HVSC mirror).
+        let html = r##"
+            <table>
+              <tr><th><a href="?C=N;O=D">Name</a></th>
+                  <th><a href="?C=M;O=A">Last modified</a></th>
+                  <th><a href="?C=S;O=A">Size</a></th>
+                  <th><a href="?C=D;O=A">Description</a></th></tr>
+              <tr><td><a href="/HVSC/C64Music/MUSICIANS/C/">Parent Directory</a></td></tr>
+              <tr><td><a href="Cool_One.sid">Cool_One.sid</a></td></tr>
+              <tr><td><a href="Deciding_to_Be.sid">Deciding_to_Be.sid</a></td></tr>
+            </table>
+        "##;
+        let links = extract_links(html);
+        // None of the four `?C=...;O=...` sort variants survive.
+        assert!(
+            !links.iter().any(|h| h.trim_start().starts_with('?')),
+            "sort-link hrefs leaked through extract_links: {:?}",
+            links
+        );
+        // Real content links are still there.
+        assert!(links.iter().any(|h| h == "Cool_One.sid"));
+        assert!(links.iter().any(|h| h == "Deciding_to_Be.sid"));
     }
 
     #[test]

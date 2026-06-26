@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-25 (rolled into 0.5.2)
+
+### Added
+
+- `RecursiveOptions::max_files: Option<usize>` and
+  `RecursiveOptions::max_pages: Option<usize>` — optional per-job overrides
+  for the built-in 10 000-files / 1 024-pages safety ceilings. Default
+  `None` preserves the existing behaviour. Callers mirroring large trees
+  (e.g. HVSC ≈ 75 000 files across thousands of directories) can raise
+  the limits explicitly without forking. The crawler still aborts past
+  whatever ceiling is set; the change just makes the ceiling configurable.
+
+## [0.5.2] - 2026-06-25
+
+### Fixed
+
+- **Recursive HTTP crawler followed Apache mod_autoindex sort links as if
+  they were distinct pages.** Directory-index servers (Apache, nginx,
+  lighttpd, IIS) put 4–5 `?C=N;O=D` / `?C=M;O=A` style links at the top of
+  every page; the old `normalize_url` stripped the URL fragment but not the
+  query string, so each sort variant got enqueued as a separate page to
+  crawl. On large trees (HVSC ≈ 3 000 leaf directories × 4 sort variants ≈
+  12 000 redundant requests) this multiplied the request count by 5× and
+  caused community mirrors to drop TCP connections mid-crawl.
+
+  Fix: `normalize_url` now strips the query string as well as the fragment.
+  `extract_links` also filters out hrefs that are pure query strings
+  (`?C=N;O=D`) as defense in depth. Two new unit tests lock the behaviour
+  (`normalize_url_strips_query_string`, `extract_links_drops_apache_sort_variants`).
+
+  This is the directory-mirror correct behaviour: two URLs that differ only
+  by query string serve the same content. If a caller later needs
+  query-aware crawling, expose a `RecursiveOptions::preserve_query` flag.
+
 ## [0.5.0] - 2026-06-09
 
 ### Added
